@@ -9,15 +9,18 @@ startup inside a temporary directory and is discarded when the process exits.
 """
 
 import collections
+import hashlib
 import ipaddress
 import json
 import os
 import ssl
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import requests
 from cryptography import x509
@@ -34,6 +37,29 @@ FLAREPROXY_HTTPS_PORT = int(os.getenv("FLAREPROXY_HTTPS_PORT", "8443"))
 FLAREPROXY_CERT_NAMES = os.getenv(
     "FLAREPROXY_CERT_NAMES", "localhost,127.0.0.1,flareproxy"
 )
+
+# Response cache: identical GET requests within this window are served from
+# memory instead of re-solving the challenge. Set to 0 to disable caching.
+CACHE_TTL = float(os.getenv("FLAREPROXY_CACHE_TTL", "300"))
+CACHE_MAX_ENTRIES = int(os.getenv("FLAREPROXY_CACHE_MAX_ENTRIES", "512"))
+
+# Reuse one persistent FlareSolverr browser session per target host so the
+# Cloudflare clearance cookie (cf_clearance) survives between requests. This is
+# the single biggest latency win (cold solve ~12s -> warm request ~1-3s).
+SESSION_ENABLED = os.getenv("FLAREPROXY_SESSION", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+# Destroy a host's session once it has been idle for this many seconds so
+# browsers are not leaked for hosts that are only queried occasionally
+# (0 = never reap). FlareSolverr itself has no idle reaper.
+SESSION_IDLE_TTL = float(os.getenv("FLAREPROXY_SESSION_IDLE_TTL", "900"))
+# Per-request timeout when talking to FlareSolverr (a cold solve can take a while).
+FLARESOLVERR_TIMEOUT = float(os.getenv("FLAREPROXY_FLARESOLVERR_TIMEOUT", "90"))
+# Prefix for the deterministic per-host session id.
+SESSION_ID_PREFIX = os.getenv("FLAREPROXY_SESSION_PREFIX", "flareproxy")
 
 # Maximum number of per-host leaf certificates kept in memory/on disk at once.
 MAX_CACHED_CERTS = 256
@@ -228,39 +254,327 @@ def _error_response(message):
     return 502, {"Content-Type": "application/json"}, json.dumps({"error": message})
 
 
+class _FlareSolverrError(Exception):
+    """Raised when FlareSolverr answers with ``status = "error"``."""
+
+
+# Errors after which a session's browser may be in an indeterminate state (a
+# failed or timed-out solve), so the session must be dropped and recreated.
+_SESSION_ERRORS = (_FlareSolverrError, requests.exceptions.Timeout)
+
+
+class _Inflight:
+    """A pending request other callers can wait on (single-flight)."""
+
+    __slots__ = ("event", "result")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+
+
+def _host_of(url):
+    """Return the ``host:port`` authority for a URL, or None if unparseable."""
+    try:
+        return urlsplit(url).netloc or None
+    except ValueError:
+        return None
+
+
+def _session_id_for(host):
+    """Deterministic, idempotent session id for a host (stable across restarts)."""
+    digest = hashlib.sha256(host.encode("utf-8")).hexdigest()[:16]
+    return "%s-%s" % (SESSION_ID_PREFIX, digest)
+
+
+class FlareSolverrClient:
+    """Stateful FlareSolverr client with session reuse, caching and single-flight.
+
+    * One persistent browser session per target host keeps the ``cf_clearance``
+      cookie warm, turning ~12s cold solves into ~1-3s warm requests.
+    * GET responses are memoised by URL for ``CACHE_TTL`` seconds.
+    * Identical concurrent GET requests collapse into a single upstream call
+      (writes are never coalesced, since they may have side effects).
+    * Requests to the same host are serialised, because a FlareSolverr session
+      holds a single (non-thread-safe) browser: one in-flight request per
+      session.
+    """
+
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+        self._cache = collections.OrderedDict()  # url -> (expiry, result)
+        self._cache_lock = threading.Lock()
+        self._sessions = {}  # host -> session id
+        self._last_used = {}  # host -> monotonic timestamp
+        self._host_locks = {}  # host -> Lock (serialises + guards creation)
+        self._state_lock = threading.Lock()
+        self._inflight = {}  # key -> _Inflight
+        self._inflight_lock = threading.Lock()
+        self._stats = {
+            "requests": 0,
+            "cache_hits": 0,
+            "coalesced": 0,
+            "session_creates": 0,
+            "session_errors": 0,
+        }
+        self._stats_lock = threading.Lock()
+        if SESSION_ENABLED and SESSION_IDLE_TTL > 0:
+            threading.Thread(
+                target=self._reap_idle_sessions,
+                name="session-reaper",
+                daemon=True,
+            ).start()
+
+    # ----- stats ---------------------------------------------------------- #
+    def _bump(self, name, amount=1):
+        with self._stats_lock:
+            self._stats[name] = self._stats.get(name, 0) + amount
+
+    def stats(self):
+        with self._stats_lock:
+            return dict(self._stats)
+
+    # ----- low level FlareSolverr calls ----------------------------------- #
+    def _call(self, payload):
+        """POST a single command to FlareSolverr and return the parsed JSON."""
+        response = requests.post(
+            self.endpoint, json=payload, timeout=FLARESOLVERR_TIMEOUT
+        )
+        data = response.json()
+        if data.get("status") != "ok":
+            raise _FlareSolverrError(data.get("message", "unknown error"))
+        return data
+
+    def _request(self, url, method, post_data, session_id):
+        """Issue one request.get/request.post. Returns (status, headers, body)."""
+        cmd = "request.post" if method == "POST" else "request.get"
+        payload = {"cmd": cmd, "url": url, "maxTimeout": 60000}
+        if session_id:
+            payload["session"] = session_id
+        if cmd == "request.post":
+            payload["postData"] = post_data or ""
+
+        data = self._call(payload)
+        solution = data.get("solution") or {}
+        try:
+            status = int(solution.get("status", 200))
+        except (TypeError, ValueError):
+            status = 502
+        if not (100 <= status <= 599):
+            status = 502
+        headers = solution.get("headers") or {}
+        body = solution.get("response") or ""
+        return status, headers, body
+
+    # ----- session management --------------------------------------------- #
+    def _host_lock(self, host):
+        with self._state_lock:
+            lock = self._host_locks.get(host)
+            if lock is None:
+                lock = threading.Lock()
+                self._host_locks[host] = lock
+            return lock
+
+    def _ensure_session(self, host):
+        """Return a live session id for host, creating one if needed.
+
+        Always called with the per-host lock held, so creation is single-flight.
+        """
+        with self._state_lock:
+            session_id = self._sessions.get(host)
+        if session_id is not None:
+            return session_id
+
+        desired = _session_id_for(host)
+        try:
+            data = self._call({"cmd": "sessions.create", "session": desired})
+        except Exception:  # noqa: BLE001 - fall back to sessionless for now
+            self._bump("session_errors")
+            return None
+
+        session_id = data.get("session") or desired
+        with self._state_lock:
+            self._sessions[host] = session_id
+            self._last_used[host] = time.monotonic()
+        self._bump("session_creates")
+        return session_id
+
+    def _touch(self, host):
+        with self._state_lock:
+            if host in self._sessions:
+                self._last_used[host] = time.monotonic()
+
+    def _destroy_session(self, host):
+        with self._state_lock:
+            session_id = self._sessions.pop(host, None)
+            self._last_used.pop(host, None)
+        if not session_id:
+            return
+        try:
+            self._call({"cmd": "sessions.destroy", "session": session_id})
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+    def _reap_idle_sessions(self):
+        """Drop browser sessions that have been idle for too long."""
+        interval = max(10.0, min(60.0, SESSION_IDLE_TTL / 4.0))
+        while True:
+            time.sleep(interval)
+            now = time.monotonic()
+            with self._state_lock:
+                stale = [
+                    host
+                    for host, last in self._last_used.items()
+                    if now - last > SESSION_IDLE_TTL
+                ]
+            for host in stale:
+                with self._host_lock(host):
+                    with self._state_lock:
+                        last = self._last_used.get(host)
+                        if last is None or now - last <= SESSION_IDLE_TTL:
+                            continue
+                    self._destroy_session(host)
+
+    # ----- cache ---------------------------------------------------------- #
+    def _cache_get(self, url):
+        with self._cache_lock:
+            item = self._cache.get(url)
+            if item is None:
+                return None
+            expiry, result = item
+            if expiry <= time.monotonic():
+                del self._cache[url]
+                return None
+            self._cache.move_to_end(url)
+            return result
+
+    def _cache_put(self, url, result):
+        with self._cache_lock:
+            self._cache[url] = (time.monotonic() + CACHE_TTL, result)
+            self._cache.move_to_end(url)
+            while len(self._cache) > CACHE_MAX_ENTRIES:
+                self._cache.popitem(last=False)
+
+    # ----- single-flight -------------------------------------------------- #
+    def _join_inflight(self, key):
+        with self._inflight_lock:
+            entry = self._inflight.get(key)
+            if entry is not None:
+                return entry, False
+            entry = _Inflight()
+            self._inflight[key] = entry
+            return entry, True
+
+    def _leave_inflight(self, key, entry):
+        entry.event.set()
+        with self._inflight_lock:
+            self._inflight.pop(key, None)
+
+    # ----- public API ----------------------------------------------------- #
+    def fetch(self, url, method="GET", post_data=None):
+        method = (method or "GET").upper()
+        cacheable = method == "GET" and CACHE_TTL > 0
+
+        if cacheable:
+            cached = self._cache_get(url)
+            if cached is not None:
+                self._bump("cache_hits")
+                return cached
+
+        if method != "GET":
+            # Never coalesce writes: identical concurrent POSTs may have side
+            # effects, so each must reach FlareSolverr. They are still
+            # serialised per host by the session lock.
+            return self._guarded_fetch(url, method, post_data)
+
+        key = url
+        entry, is_leader = self._join_inflight(key)
+        if not is_leader:
+            self._bump("coalesced")
+            entry.event.wait()
+            return entry.result
+
+        result = None
+        try:
+            # A leader that raced a just-finished leader can still hit cache.
+            if cacheable:
+                result = self._cache_get(url)
+                if result is not None:
+                    self._bump("cache_hits")
+            if result is None:
+                result = self._fetch_uncached(url, method, post_data)
+                if cacheable and 200 <= result[0] < 300:
+                    self._cache_put(url, result)
+        except _FlareSolverrError as exc:
+            result = _error_response("FlareSolverr error: %s" % exc)
+        except Exception as exc:  # noqa: BLE001 - never let a request crash
+            result = _error_response("FlareSolverr request failed: %s" % exc)
+        finally:
+            # Publish the outcome *before* waking followers, so coalesced
+            # callers always observe a concrete result (never None).
+            entry.result = result
+            self._leave_inflight(key, entry)
+        return result
+
+    def _guarded_fetch(self, url, method, post_data):
+        """Run a non-coalesced request, turning errors into a 502 tuple."""
+        try:
+            return self._fetch_uncached(url, method, post_data)
+        except _FlareSolverrError as exc:
+            return _error_response("FlareSolverr error: %s" % exc)
+        except Exception as exc:  # noqa: BLE001 - never let a request crash
+            return _error_response("FlareSolverr request failed: %s" % exc)
+
+    def _fetch_uncached(self, url, method, post_data):
+        self._bump("requests")
+        host = _host_of(url)
+        if SESSION_ENABLED and host:
+            with self._host_lock(host):
+                session_id = self._ensure_session(host)
+                if session_id is not None:
+                    try:
+                        result = self._request(url, method, post_data, session_id)
+                    except _SESSION_ERRORS:
+                        # The solve failed or timed out; the driver may be in an
+                        # indeterminate state, so drop the session and retry once
+                        # with a fresh browser.
+                        self._bump("session_errors")
+                        self._destroy_session(host)
+                        session_id = self._ensure_session(host)
+                        if session_id is None:
+                            return self._request_sessionless(
+                                url, method, post_data
+                            )
+                        try:
+                            result = self._request(
+                                url, method, post_data, session_id
+                            )
+                        except _SESSION_ERRORS:
+                            self._destroy_session(host)
+                            raise
+                    self._touch(host)
+                    return result
+        return self._request_sessionless(url, method, post_data)
+
+    def _request_sessionless(self, url, method, post_data):
+        return self._request(url, method, post_data, None)
+
+
+_CLIENT = FlareSolverrClient(FLARESOLVERR_URL)
+
+
 def fetch_via_flaresolverr(url, method="GET", post_data=None):
     """Relay a request through FlareSolverr.
 
     Returns a tuple ``(status, headers_dict, body_str)``. On failure it returns
     a 502 JSON error rather than raising.
     """
-    method = (method or "GET").upper()
-    cmd = "request.post" if method == "POST" else "request.get"
-    payload = {"cmd": cmd, "url": url, "maxTimeout": 60000}
-    if cmd == "request.post":
-        payload["postData"] = post_data or ""
-
     try:
-        response = requests.post(FLARESOLVERR_URL, json=payload, timeout=90)
-        data = response.json()
+        return _CLIENT.fetch(url, method, post_data)
+    except _FlareSolverrError as exc:
+        return _error_response("FlareSolverr error: %s" % exc)
     except Exception as exc:  # noqa: BLE001 - never let a request crash the server
         return _error_response("FlareSolverr request failed: %s" % exc)
-
-    if data.get("status") != "ok":
-        return _error_response(
-            "FlareSolverr error: %s" % data.get("message", "unknown error")
-        )
-
-    solution = data.get("solution") or {}
-    try:
-        status = int(solution.get("status", 200))
-    except (TypeError, ValueError):
-        status = 502
-    if not (100 <= status <= 599):
-        status = 502
-    headers = solution.get("headers") or {}
-    body = solution.get("response", "") or ""
-    return status, headers, body
 
 
 def _sanitize_header_value(value):
@@ -679,6 +993,16 @@ def main():
         flush=True,
     )
     print("  FlareSolverr:  %s" % FLARESOLVERR_URL, flush=True)
+    print(
+        "  Sessions:      %s (idle TTL %gs)"
+        % ("enabled" if SESSION_ENABLED else "disabled", SESSION_IDLE_TTL),
+        flush=True,
+    )
+    print(
+        "  Response cache: %s"
+        % ("%gs TTL" % CACHE_TTL if CACHE_TTL > 0 else "disabled"),
+        flush=True,
+    )
     print(
         "Note: TLS certificates are ephemeral and regenerated on every start.",
         flush=True,

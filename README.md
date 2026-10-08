@@ -21,6 +21,34 @@ docker run -e FLARESOLVERR_URL=http://localhost:8191/v1 -p 8080:8080 -p 8443:844
 | `FLAREPROXY_PORT` | `8080` | Plain HTTP proxy listener port. |
 | `FLAREPROXY_HTTPS_PORT` | `8443` | TLS proxy listener port. |
 | `FLAREPROXY_CERT_NAMES` | `localhost,127.0.0.1,flareproxy` | Comma separated names covered by the proxy's own TLS certificate (all added as SAN entries). |
+| `FLAREPROXY_SESSION` | `true` | Reuse one persistent FlareSolverr browser session per target host so the Cloudflare clearance cookie survives between requests. Set to `false` to fall back to a fresh browser per request (slow). |
+| `FLAREPROXY_SESSION_IDLE_TTL` | `900` | Destroy a host session after this many seconds of inactivity, so idle browsers are not leaked. `0` keeps sessions forever. |
+| `FLAREPROXY_SESSION_PREFIX` | `flareproxy` | Prefix for the deterministic per-host session id. |
+| `FLAREPROXY_CACHE_TTL` | `300` | Cache successful GET responses by URL for this many seconds. `0` disables the cache (useful for volatile content). |
+| `FLAREPROXY_CACHE_MAX_ENTRIES` | `512` | Maximum number of cached URLs (LRU eviction). |
+| `FLAREPROXY_FLARESOLVERR_TIMEOUT` | `90` | Per-request timeout, in seconds, when talking to FlareSolverr. |
+
+## Performance
+
+FlareSolverr solves each Cloudflare challenge in a fresh browser and then quits
+it, so a stateless request costs ~12s and re-solves every time. FlareProxy adds
+three layers on top:
+
+1. **Session reuse** — a persistent session per target host keeps the
+   `cf_clearance` cookie warm, so repeat requests skip the challenge
+   (~12s → ~1–3s). Sessions are serialised per host because a FlareSolverr
+   session holds a single browser, and they are dropped after
+   `FLAREPROXY_SESSION_IDLE_TTL` of inactivity.
+2. **Response cache** — successful `GET` responses are memoised by URL for
+   `FLAREPROXY_CACHE_TTL` seconds. Prices and similar slow-moving data are
+   ideal; tune the TTL down for sites that change quickly.
+3. **Single-flight** — identical concurrent GET requests are collapsed into one
+   upstream call, so a burst does not queue behind the same solve. Writes
+   (POST) are never coalesced, since they may have side effects.
+
+> Client timeouts must be longer than a cold solve. A request that times out
+> mid-solve is retried by the client and triggers a second, full solve.
+> FlareProxy's own requests use a 60s `maxTimeout` against FlareSolverr.
 
 ## Usage
 Set FlareProxy as a proxy in your browser or in your agent. You can connect over plain HTTP or over HTTPS (the proxy itself speaks TLS as well).
@@ -88,6 +116,9 @@ Add the snippet to your docker compose stack, i.e.:
     - FLAREPROXY_PORT=8080
     - FLAREPROXY_HTTPS_PORT=8443
     - FLAREPROXY_CERT_NAMES=localhost,127.0.0.1,flareproxy
+    - FLAREPROXY_SESSION=true
+    - FLAREPROXY_SESSION_IDLE_TTL=900
+    - FLAREPROXY_CACHE_TTL=300
     - TZ=Europe/Rome
 #    ports:
 #    - "8080:8080"
