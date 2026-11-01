@@ -39,6 +39,8 @@ Cases:
   every time.
 - **F. POST never coalesced** — `MOCK_DELAY=1.0`; five concurrent identical
   POSTs each reach upstream (writes must not be collapsed), all returning 200.
+- **G. Configurable solve timeout** — `FLARESOLVERR_MAX_TIMEOUT_SEC=140` is sent
+  to FlareSolverr as `maxTimeout=140000` milliseconds.
 
 Per-case logs are written to `/tmp/opencode/` (`mock-<port>.log`,
 `flareproxy-<port>.log`). The process exits `0` only if every case passes.

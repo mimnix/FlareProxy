@@ -416,6 +416,32 @@ def test_post_not_coalesced():
         mock.stop()
 
 
+@case("G. maxTimeout comes from FLARESOLVERR_MAX_TIMEOUT_SEC (seconds -> ms)")
+def test_max_timeout_env():
+    mock = Mock(delay=0.0)
+    proxy = Proxy(
+        mock.port,
+        {"FLAREPROXY_CACHE_TTL": "0", "FLARESOLVERR_MAX_TIMEOUT_SEC": "140"},
+    )
+    try:
+        url = "http://target.test/slow-challenge"
+        status, _ = proxy.get(url)
+        assert status == 200, "response status %s" % status
+        st = mock.state()
+        seen = [
+            e.get("max_timeout")
+            for e in st["events"]
+            if e.get("method") == "request.get" and e.get("url") == url
+        ]
+        assert seen == [140000], (
+            "expected one upstream request with maxTimeout=140000ms, got %r"
+            % (seen,)
+        )
+    finally:
+        proxy.stop()
+        mock.stop()
+
+
 CASES = [
     test_session_reuse,
     test_cache,
@@ -423,6 +449,7 @@ CASES = [
     test_sessionless,
     test_cache_disabled,
     test_post_not_coalesced,
+    test_max_timeout_env,
 ]
 
 

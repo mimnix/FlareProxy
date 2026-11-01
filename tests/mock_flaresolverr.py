@@ -146,6 +146,7 @@ def _handle_command(payload):
                         "url": url,
                         "method": cmd,
                         "visit": visit,
+                        "max_timeout": payload.get("maxTimeout"),
                     }
                 )
             _record(
@@ -155,6 +156,7 @@ def _handle_command(payload):
                     "url": url,
                     "session": sid,
                     "visit": visit,
+                    "max_timeout": payload.get("maxTimeout"),
                 }
             )
         body = "visits=%d,session=%s" % (visit, label)

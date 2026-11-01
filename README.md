@@ -26,7 +26,8 @@ docker run -e FLARESOLVERR_URL=http://localhost:8191/v1 -p 8080:8080 -p 8443:844
 | `FLAREPROXY_SESSION_PREFIX` | `flareproxy` | Prefix for the deterministic per-host session id. |
 | `FLAREPROXY_CACHE_TTL` | `300` | Cache successful GET responses by URL for this many seconds. `0` disables the cache (useful for volatile content). |
 | `FLAREPROXY_CACHE_MAX_ENTRIES` | `512` | Maximum number of cached URLs (LRU eviction). |
-| `FLAREPROXY_FLARESOLVERR_TIMEOUT` | `90` | Per-request timeout, in seconds, when talking to FlareSolverr. |
+| `FLARESOLVERR_MAX_TIMEOUT_SEC` | `60` | Solve timeout, in seconds, sent to FlareSolverr as `maxTimeout`. Raise it for sites whose challenge takes longer than a minute. |
+| `FLAREPROXY_FLARESOLVERR_TIMEOUT` | `max(90, FLARESOLVERR_MAX_TIMEOUT_SEC + 30)` | Per-request HTTP timeout, in seconds, when talking to FlareSolverr. Must exceed `FLARESOLVERR_MAX_TIMEOUT_SEC`. |
 
 ## Performance
 
@@ -48,7 +49,10 @@ three layers on top:
 
 > Client timeouts must be longer than a cold solve. A request that times out
 > mid-solve is retried by the client and triggers a second, full solve.
-> FlareProxy's own requests use a 60s `maxTimeout` against FlareSolverr.
+> FlareProxy sends `FLARESOLVERR_MAX_TIMEOUT_SEC` (default 60s) as
+> FlareSolverr's `maxTimeout`; raise it for slow challenges (e.g. `140`), and
+> keep `FLAREPROXY_FLARESOLVERR_TIMEOUT` above it (it is derived automatically
+> unless set explicitly).
 
 ## Usage
 Set FlareProxy as a proxy in your browser or in your agent. You can connect over plain HTTP or over HTTPS (the proxy itself speaks TLS as well).
@@ -119,6 +123,7 @@ Add the snippet to your docker compose stack, i.e.:
     - FLAREPROXY_SESSION=true
     - FLAREPROXY_SESSION_IDLE_TTL=900
     - FLAREPROXY_CACHE_TTL=300
+    - FLARESOLVERR_MAX_TIMEOUT_SEC=60
     - TZ=Europe/Rome
 #    ports:
 #    - "8080:8080"
