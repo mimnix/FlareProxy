@@ -56,8 +56,21 @@ SESSION_ENABLED = os.getenv("FLAREPROXY_SESSION", "true").strip().lower() not in
 # browsers are not leaked for hosts that are only queried occasionally
 # (0 = never reap). FlareSolverr itself has no idle reaper.
 SESSION_IDLE_TTL = float(os.getenv("FLAREPROXY_SESSION_IDLE_TTL", "900"))
-# Per-request timeout when talking to FlareSolverr (a cold solve can take a while).
-FLARESOLVERR_TIMEOUT = float(os.getenv("FLAREPROXY_FLARESOLVERR_TIMEOUT", "90"))
+# Server-side solve timeout, in seconds, sent to FlareSolverr as `maxTimeout`
+# (FlareSolverr expects milliseconds). Raise this for sites whose challenge
+# takes longer than a minute to solve.
+FLARESOLVERR_MAX_TIMEOUT_SEC = float(
+    os.getenv("FLARESOLVERR_MAX_TIMEOUT_SEC", "60")
+)
+# Per-request HTTP timeout when talking to FlareSolverr (a cold solve can take a
+# while). Defaults to at least 30s more than the solve timeout, so the HTTP call
+# never aborts before FlareSolverr's own maxTimeout.
+FLARESOLVERR_TIMEOUT = float(
+    os.getenv(
+        "FLAREPROXY_FLARESOLVERR_TIMEOUT",
+        str(max(90.0, FLARESOLVERR_MAX_TIMEOUT_SEC + 30.0)),
+    )
+)
 # Prefix for the deterministic per-host session id.
 SESSION_ID_PREFIX = os.getenv("FLAREPROXY_SESSION_PREFIX", "flareproxy")
 
@@ -348,7 +361,11 @@ class FlareSolverrClient:
     def _request(self, url, method, post_data, session_id):
         """Issue one request.get/request.post. Returns (status, headers, body)."""
         cmd = "request.post" if method == "POST" else "request.get"
-        payload = {"cmd": cmd, "url": url, "maxTimeout": 60000}
+        payload = {
+            "cmd": cmd,
+            "url": url,
+            "maxTimeout": int(FLARESOLVERR_MAX_TIMEOUT_SEC * 1000),
+        }
         if session_id:
             payload["session"] = session_id
         if cmd == "request.post":
@@ -993,6 +1010,11 @@ def main():
         flush=True,
     )
     print("  FlareSolverr:  %s" % FLARESOLVERR_URL, flush=True)
+    print(
+        "  Timeouts:      solve %gs / HTTP %gs"
+        % (FLARESOLVERR_MAX_TIMEOUT_SEC, FLARESOLVERR_TIMEOUT),
+        flush=True,
+    )
     print(
         "  Sessions:      %s (idle TTL %gs)"
         % ("enabled" if SESSION_ENABLED else "disabled", SESSION_IDLE_TTL),
